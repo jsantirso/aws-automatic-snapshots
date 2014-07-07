@@ -61,6 +61,10 @@ Dependencies
 
 
 
-**Copyright** (c) 2014 Joel Santirso
+Copyright
+---------
+Joel Santirso, 2014
 
-**License**: MIT
+License
+-------
+This projected is licensed under the terms of the MIT license.
