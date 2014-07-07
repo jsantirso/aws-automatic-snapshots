@@ -62,10 +62,14 @@ Dependencies
 - [python-dateutil](https://pypi.python.org/pypi/python-dateutil)
 
 
+Copyright
+---------
+Joel Santirso, 2014
 
-**Copyright** (c) 2014 Joel Santirso
 
-**License**: MIT"""
+License
+-------
+This projected is licensed under the terms of the MIT license."""
 
 #
 # CONFIGURATION (EDIT THIS SECTION)
