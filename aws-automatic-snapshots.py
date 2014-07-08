@@ -11,6 +11,23 @@ Features
 - Easy to use, it leverages **AWS's tags** to select the volumes to back up
 - Written in **Python**, it's easy to customize and install using Cron
 - It supports **unlimited**, **fine-grained** custom policies
+```
+	{
+		'DATA': {  # Tag your data volume as "AUTO-SNAPSHOT" : "DATA" to activate the automatic backups
+			'hour':   2,  # Make a backup each hour, keep the last two, and delete the rest
+			'day':	  5,  # Make a backup each day, keep the last five, and delete the rest
+			'week':  52,  # ...
+			'month':  0   # Don't make a monthly backup, but delete any backups of this type you find
+		},
+		'ROOT-FILESYSTEM': {
+			'hour':   0,
+			'day':    0,
+			'week':   1,
+			'month':  0
+		},
+		...
+	}
+```
 
 Usage
 -----
