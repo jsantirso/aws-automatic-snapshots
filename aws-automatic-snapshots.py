@@ -3,30 +3,36 @@
 AWS Automatic Snapshots
 =======================
 
-This script performs automatic snapshots (backups) of tagged EBS volumes, with configurable periodicity and retention policies.
+This script performs automatic snapshots (backups) of tagged EBS volumes, with configurable periodicity and retention
+policies.
 
 
 Features
 --------
 - Easy to use, it leverages **AWS's tags** to select the volumes to back up
 - Written in **Python**, it's easy to customize and install using Cron
-- It supports **unlimited**, **fine-grained** custom policies
+- It support **"before" and "after" hooks**, which can be used to lock and unlock a database or filesystem
+- It supports **unlimited**, **fine-grained** custom policies. For example:
 ```
-	{
-		'DATA': {  # Tag your data volume as "AUTO-SNAPSHOT" : "DATA" to activate the automatic backups
-			'hour':   2,  # Make a backup each hour, keep the last two, and delete the rest
-			'day':	  5,  # Make a backup each day, keep the last five, and delete the rest
-			'week':  52,  # ...
-			'month':  0   # Don't make a monthly backup, but delete any backups of this type you find
-		},
-		'ROOT-FILESYSTEM': {
-			'hour':   0,
-			'day':    0,
-			'week':   1,
-			'month':  0
-		},
-		...
-	}
+    {
+        "CRITICAL": {     # Tag your data volume as "AUTO-SNAPSHOT" : "CRITICAL" to activate the automatic backups
+            "hour":   2,  # Create a snapshot each hour, keep the last two, and delete the rest
+            "day":    5,  # Create a snapshot each day, keep the last five, and delete the rest
+            "week":  52,  # Create a snapshot each week, keep the last 52, and delete the rest
+            "month":  0,  # Don't make a monthly snapshot, and delete any existing snapshots for this policy and period
+            "only_attached_vols": True,  # Only snapshot volumes which are attached to the current instance
+            "hook_module": "/usr/local/bin/flush_and_lock_mysql.py"  # A module with "before" and "after" hooks
+        },
+        "MEH": {
+            "hour":   0,
+            "day":    0,
+            "week":   0,
+            "month":  1,
+            "only_attached_vols": True,
+            "hook_module": None
+        },
+        ...
+    }
 ```
 
 Usage
@@ -60,7 +66,16 @@ Usage
 
 - Edit the script and customize the configuration
 
+
+- Optionally, create a Python script that defines the following functions:
+```
+    aws_automatic_snapshots_before(period, policy, volume)
+    aws_automatic_snapshots_after(period, policy, volume, snapshot)
+```
+
+
 - Tag your EBS Volumes with the policies you have defined. For example: ```"AUTO-SNAPSHOTS"``` : ```"CRITICAL"```
+
 
 - Edit Crontab to execute your script periodically:
 
@@ -72,7 +87,7 @@ Usage
 @weekly /usr/local/bin/aws-automatic-snapshots.py week
 @monthly /usr/local/bin/aws-automatic-snapshots.py month
 ```
-	
+
 Dependencies
 ------------
 - [boto](https://pypi.python.org/pypi/boto/)
@@ -81,12 +96,13 @@ Dependencies
 
 Copyright
 ---------
-Joel Santirso, 2014
+Joel Santirso, 2015
 
 
 License
 -------
 This projected is licensed under the terms of the MIT license."""
+
 
 #
 # CONFIGURATION (EDIT THIS SECTION)
@@ -109,24 +125,30 @@ config = {
     #   - The name is arbitrary
     #   - The value defines the creation and retention of snapshots for each time period (hour, day, week and month)
     #       - 0: no snapshot will be created for that period, and old snapshots will be deleted
-    #       - N: a new snapshot will be created for the period; the last N will be kept and the rest will be deleted
+    #       - N: a new snapshot will be created for the period, the last N will be kept, and the rest will be deleted
+    #   - The optional key "only_attached_vols" can be used to only make snapshots of volumes attached to the current
+    #     instance.
+    #     This is useful to create multiple instances from an AMI that has automatic-snapshots configured: if not set
+    #     every instance would snapshot every volume, resulting in multiple copies of the same data
     'policies': {
         'CRITICAL': {
-            'hour':  6,
-            'day':   7,
-            'week':  4,
-            'month': 6
+            'hour':   2,
+            'day':    5,
+            'week':  52,
+            'month':  0,
+            'only_attached_vols': True
         },
         'MEH': {
-            'hour':  0,
-            'day':   2,
-            'week':  1,
-            'month': 0
+            'hour':   0,
+            'day':    0,
+            'week':   0,
+            'month':  1,
+            'only_attached_vols': True
         }
     },
 
     # (Optional) Path to the log file
-    'log_file': '/home/ec2-user/aws-auto-snapshots.log',
+    # 'log_file': '/home/ec2-user/aws-auto-snapshots.log',
 
 }
 # A tag that will be added to the snapshots
@@ -138,19 +160,23 @@ config['tag_period'] = '%s-PERIOD' % config['tag']
 #
 
 def main():
-    import boto.ec2
-    import argparse
     from datetime import datetime, timedelta
     from collections import defaultdict
     import dateutil.parser
-    import time
-    import sys
+    import boto.utils
+    import boto.ec2
+    import argparse
     import logging
+    import time
+    import imp
+    import sys
+    import os
 
     try:
         # We get the period
         parser = argparse.ArgumentParser(
-            description='A program that creates automatic AWS Volume snapshots. Read the script for more information.')
+            description='A program that creates automatic AWS Volume snapshots. Read the script for more information.'
+        )
         parser.add_argument('period', choices=('hour', 'day', 'week', 'month'))
         period = parser.parse_args().period
 
@@ -171,64 +197,84 @@ def main():
         )
         logging.info('Connected to aws')
 
+        # We get the current instance's metadata
+        instance_metadata = None  # boto.utils.get_instance_metadata()
+
+        # We cache the volumes affected by each policy
+        volumes_to_process = {}
+        for policy, settings in config['policies'].iteritems():
+            volume_filters = {'tag:%s' % config['tag']: policy}
+            if settings.get('only_attached_vols', False):
+                volume_filters['attachment.instance-id'] = instance_metadata['instance-id']
+            volumes_to_process[policy] = conn.get_all_volumes(filters=volume_filters)
+
         #
         # We create the new snapshots
         #
 
-        # We get the list of tags that must be processed this period
-        logging.info('Policies (volume tag values) to snapshot:')
-        policies_to_snapshot = [key for key, value in config['policies'].items() if value.get(period, None)]
-        logging.info(', '.join(policies_to_snapshot))
-
-        # We process each policy
-        for policy in policies_to_snapshot:
-            logging.info('Processing "%s"' % policy)
-
-            # We get the volumes that have the policy
-            volumes_to_snapshot = conn.get_all_volumes(filters={'tag:%s' % config['tag']: policy})
-            logging.info('Volumes:')
-            logging.info(', '.join(['%s (%sGiB)' % (vol.id, vol.size) for vol in volumes_to_snapshot]))
-
-            # We process the volumes
-            for vol in volumes_to_snapshot:
+        logging.info('Creating the snapshots for each policy:')
+        policies_to_snapshot = [(p, s) for p, s in config['policies'].iteritems() if s.get(period, None)]
+        for policy, settings in policies_to_snapshot:
+            logging.info(
+                'Processing "%s" (only_attached_vols: %s)' %
+                (policy, settings.get('only_attached_vols', False))
+            )
+            for vol in volumes_to_process[policy]:
+                hook_module_path = settings.get('hook_module', None)
+                hook_module = None
+                snap = None
                 try:
-                    # We get its name
-                    name_tags = conn.get_all_tags({'resource-id': vol.id, 'key': 'Name'})
-                    name = name_tags[0].value if name_tags else '(un-named volume)'
-                    logging.info('Creating the snapshot for %s (%sGiB - "%s")' % (vol.id, vol.size, name))
                     # We create the new snapshot for this policy and period
-                    snap = vol.create_snapshot(
-                        description='Automatic snapshot, period "%s"' % period
+                    logging.info(
+                        'Creating the snapshot for %s ("%s", %sGiB)' %
+                        (vol.id, vol.tags.get('Name', ''), vol.size)
                     )
-                    # We add some tags
+                    if hook_module_path:
+                        logging.info('Loading the hook module (%s)' % hook_module_path)
+                        hook_module = imp.load_source('hook_module', hook_module_path)
+                            # If the module was already initialized, it will be initialized again
+                        logging.info('Executing hook (before)')
+                        hook_module.aws_automatic_snapshots_before(period, policy, vol)
+                        logging.info('Done')
+
+                    snap = vol.create_snapshot(description='Automatic snapshot, period "%s"' % period)
                     conn.create_tags(
                         resource_ids=[snap.id],
                         tags={
                             # The name, which is based on the name of the volume
-                            'Name': '[AS]%s' % name,
+                            'Name': '[AS]%s' % vol.tags.get('Name', ''),
                             # The period
                             config['tag_period']: period
                         }
                     )
+                    logging.info('Snapshot created')
                 except Exception, e:
                     logging.error('Error processing volume %s' % vol.id)
                     logging.error(e)
-            logging.info('Done')
+                finally:
+                    try:
+                        if hook_module_path and hook_module:
+                            logging.info('Executing hook (after)')
+                            hook_module.aws_automatic_snapshots_after(period, policy, vol, snap)
+                            logging.info('Done')
+                    except Exception, e:
+                        logging.error('Error executing the hooks: %s' % e)
 
-        logging.info('Finished creating the snapshots')
+        if policies_to_snapshot:
+            # We wait for a bit just in case Amazon needs some time to consolidate the new snapshots
+            time.sleep(5)
+        else:
+            logging.info('No policies required snapshots for this period')
 
         #
         # We delete the old snapshots
         #
 
-        logging.info('Deleting old snapshots')
-
-        # We wait for a bit just in case Amazon needs some time to consolidate the new snapshots
-        time.sleep(2)
+        logging.info('Deleting old snapshots for this period:')
 
         # We process the volumes that are managed by one of our auto-snapshot policies
-        for policy in config['policies'].keys():
-            for vol in conn.get_all_volumes(filters={'tag:%s' % config['tag']: policy}):
+        for policy, settings in config['policies'].iteritems():
+            for vol in volumes_to_process[policy]:
                 try:
                     # We get its snapshots for the period we are processing
                     raw_snapshots = conn.get_all_snapshots(
@@ -238,9 +284,12 @@ def main():
                             'tag:%s' % config['tag_period']: period
                         }
                     )
-                    logging.info('Processing volume %s (%sGiB, %s snapshot(s))' % (vol.id, vol.size, len(raw_snapshots)))
+                    logging.info(
+                        'Processing volume %s ("%s", %sGiB, %s snapshot(s))' %
+                        (vol.id, vol.tags.get('Name', ''), vol.size, len(raw_snapshots))
+                    )
                     # We get which snapshots must be deleted, depending on the retention period configuration
-                    if config['policies'][policy][period]:
+                    if settings.get(period, None):
                         sorted_snapshots = sorted(
                             raw_snapshots,
                             cmp=lambda x, y: cmp(
@@ -248,21 +297,24 @@ def main():
                                 dateutil.parser.parse(y.start_time)
                             )
                         )
-                        must_delete = sorted_snapshots[:-config['policies'][policy][period]]
+                        must_delete = sorted_snapshots[:-settings[period]]
                     else:
                         must_delete = raw_snapshots
                     if must_delete:
                         logging.info('Deleting %s snapshot(s)' % len(must_delete))
                         for snap in must_delete:
                             snap.delete()
+                        logging.info('Done')
                     else:
                         logging.info('Nothing to delete')
-                    logging.info('Done')
                 except Exception, e:
-                    logging.error('Error processing volume %s (%sGiB)' % (vol.id, vol.size))
+                    logging.error(
+                        'Error processing volume %s ("%s", %sGiB)' %
+                        (vol.id, vol.tags.get('Name', ''), vol.size)
+                    )
                     logging.error(e)
 
-        logging.info('Finished deleting old snapshots')
+        logging.info('FINISHED PROCESSING THE PERIOD')
 
     except Exception, e:
         logging.error('EXCEPTION: %s' % e)
