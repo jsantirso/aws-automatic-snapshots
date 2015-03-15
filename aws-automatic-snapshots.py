@@ -148,7 +148,7 @@ config = {
     },
 
     # (Optional) Path to the log file
-    # 'log_file': '/home/ec2-user/aws-auto-snapshots.log',
+    # 'log_file': '/home/ec2-user/aws-auto-snapshots.log'
 
 }
 # A tag that will be added to the snapshots
@@ -165,6 +165,7 @@ def main():
     import dateutil.parser
     import boto.utils
     import boto.ec2
+    import traceback
     import argparse
     import logging
     import time
@@ -198,7 +199,7 @@ def main():
         logging.info('Connected to aws')
 
         # We get the current instance's metadata
-        instance_metadata = None  # boto.utils.get_instance_metadata()
+        instance_metadata = boto.utils.get_instance_metadata()
 
         # We cache the volumes affected by each policy
         volumes_to_process = {}
@@ -250,7 +251,7 @@ def main():
                     logging.info('Snapshot created')
                 except Exception, e:
                     logging.error('Error processing volume %s' % vol.id)
-                    logging.error(e)
+                    logging.error(traceback.format_exc())
                 finally:
                     try:
                         if hook_module_path and hook_module:
@@ -258,7 +259,8 @@ def main():
                             hook_module.aws_automatic_snapshots_after(period, policy, vol, snap)
                             logging.info('Done')
                     except Exception, e:
-                        logging.error('Error executing the hooks: %s' % e)
+                        logging.error('Error executing the hooks')
+                        logging.error(traceback.format_exc())
 
         if policies_to_snapshot:
             # We wait for a bit just in case Amazon needs some time to consolidate the new snapshots
@@ -312,13 +314,12 @@ def main():
                         'Error processing volume %s ("%s", %sGiB)' %
                         (vol.id, vol.tags.get('Name', ''), vol.size)
                     )
-                    logging.error(e)
+                    logging.error(traceback.format_exc())
 
         logging.info('FINISHED PROCESSING THE PERIOD')
 
     except Exception, e:
-        logging.error('EXCEPTION: %s' % e)
-        logging.error(sys.exc_info()[0])
+        logging.error(traceback.format_exc())
 
 if __name__ == '__main__':
     main()
